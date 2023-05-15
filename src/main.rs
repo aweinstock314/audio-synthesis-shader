@@ -52,6 +52,14 @@ impl eframe::App for EguiApp {
     }
 }
 
+#[derive(Copy, Clone, Pod, Zeroable)]
+#[repr(C)]
+struct Params {
+    time: f32,
+    sample_rate: u32,
+    samples: u32,
+}
+
 fn main() -> anyhow::Result<()> {
     let host = cpal::default_host();
     let audio_device = host
@@ -82,8 +90,10 @@ fn main() -> anyhow::Result<()> {
     )?;
     cpal_stream.play()?;
 
-    let (mut oddio_stream_handle, oddio_stream) =
-        oddio::split(oddio::Stream::new(sample_rate.0, sample_rate.0 as usize));
+    let (mut oddio_stream_handle, oddio_stream) = oddio::split(oddio::Stream::new(
+        sample_rate.0,
+        4 * sample_rate.0 as usize,
+    ));
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let adapter = instance
@@ -177,53 +187,60 @@ fn main() -> anyhow::Result<()> {
         entry_point: "compute_main",
     });
 
-    #[derive(Copy, Clone, Pod, Zeroable)]
-    #[repr(C)]
-    struct Params {
-        time: f32,
-        sample_rate: u32,
-        samples: u32,
-    }
-
     let mut belt = wgpu::util::StagingBelt::new(1024);
-    println!("{} {:?}", sample_rate.0, bytemuck::bytes_of(&sample_rate.0));
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    belt.write_buffer(
-        &mut encoder,
-        &params_buffer,
-        0,
-        NonZeroU64::new(12).unwrap(),
-        &device,
-    )
-    .copy_from_slice(bytemuck::bytes_of(&Params {
-        time: 0.0,
-        sample_rate: sample_rate.0,
-        samples: sample_rate.0,
-    }));
-    belt.finish();
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
-        drop(pass);
-    }
-    let _ = queue.submit(vec![encoder.finish()]);
-    wgpu::util::DownloadBuffer::read_buffer(
-        &device,
-        &queue,
-        &output_buffer.slice(..),
-        move |buf| {
-            if let Ok(buf) = buf {
-                let cast_buf = bytemuck::cast_slice::<u8, [f32; 2]>(&buf);
-                println!("read_buffer: {:?} {:?}", cast_buf.len(), &cast_buf[0..10]);
-                oddio_stream_handle
-                    .control::<oddio::Stream<_>, _>()
-                    .write(cast_buf);
+    std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut time = 0.0;
+        loop {
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            belt.write_buffer(
+                &mut encoder,
+                &params_buffer,
+                0,
+                NonZeroU64::new(12).unwrap(),
+                &device,
+            )
+            .copy_from_slice(bytemuck::bytes_of(&Params {
+                time,
+                sample_rate: sample_rate.0,
+                samples: sample_rate.0,
+            }));
+            belt.finish();
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+                drop(pass);
             }
-        },
-    );
-    device.poll(wgpu::Maintain::Wait);
+            let _ = queue.submit(vec![encoder.finish()]);
+            wgpu::util::DownloadBuffer::read_buffer(&device, &queue, &output_buffer.slice(..), {
+                let tx = tx.clone();
+                move |buf| {
+                    if let Ok(buf) = buf {
+                        let cast_buf = bytemuck::cast_slice::<u8, [f32; 2]>(&buf);
+                        //println!("read_buffer: {:?} {:?}", cast_buf.len(), &cast_buf[0..10]);
+                        let _ = tx.send(cast_buf.to_vec());
+                    }
+                }
+            });
+            device.poll(wgpu::Maintain::Wait);
+            while let Ok(buf) = rx.try_recv() {
+                let mut i = 0;
+                while i < buf.len() {
+                    let ret = oddio_stream_handle
+                        .control::<oddio::Stream<_>, _>()
+                        .write(&buf[i..]);
+                    if ret == 0 {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    i += ret;
+                }
+            }
+            time += 1.0;
+        }
+    });
 
     scene_handle.control::<Mixer<_>, _>().play(oddio_stream);
 
