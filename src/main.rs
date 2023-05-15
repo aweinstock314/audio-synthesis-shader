@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
 
     let (mut oddio_stream_handle, oddio_stream) = oddio::split(oddio::Stream::new(
         sample_rate.0,
-        4 * sample_rate.0 as usize,
+        sample_rate.0 as usize,
     ));
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
