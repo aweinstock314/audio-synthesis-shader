@@ -16,7 +16,7 @@ use std::{
     num::NonZeroU64,
     sync::mpsc::{self, TryRecvError},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct EguiApp {
@@ -79,7 +79,7 @@ impl eframe::App for EguiApp {
 #[derive(Copy, Clone, Pod, Zeroable)]
 #[repr(C)]
 struct Params {
-    time: f32,
+    samples_elapsed: u32,
     sample_rate: u32,
     samples: u32,
     sliders: [f32; 2],
@@ -120,8 +120,10 @@ fn main() -> anyhow::Result<()> {
     )?;
     cpal_stream.play()?;
 
-    let (mut oddio_stream_handle, oddio_stream) =
-        oddio::split(oddio::Stream::new(sample_rate.0, sample_rate.0 as usize));
+    let (mut oddio_stream_handle, oddio_stream) = oddio::split(oddio::Stream::new(
+        sample_rate.0,
+        sample_rate.0 as usize / 4,
+    ));
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let adapter = instance
@@ -222,8 +224,8 @@ fn main() -> anyhow::Result<()> {
     std::thread::spawn({
         move || {
             let (tx, rx) = std::sync::mpsc::channel();
-            let mut time = 0.0;
-            let samples_per_iter = sample_rate.0;
+            let mut samples_elapsed = 0;
+            let samples_per_iter = 1 * sample_rate.0 / 8;
             let mut sliders = [0.0; 2];
             'outer: loop {
                 'inner: loop {
@@ -259,6 +261,7 @@ fn main() -> anyhow::Result<()> {
                         Err(TryRecvError::Disconnected) => break 'outer,
                     }
                 }
+                let start = Instant::now();
                 let mut encoder =
                     device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                 belt.write_buffer(
@@ -269,7 +272,7 @@ fn main() -> anyhow::Result<()> {
                     &device,
                 )
                 .copy_from_slice(bytemuck::bytes_of(&Params {
-                    time,
+                    samples_elapsed,
                     sample_rate: sample_rate.0,
                     samples: samples_per_iter,
                     sliders,
@@ -300,6 +303,8 @@ fn main() -> anyhow::Result<()> {
                     },
                 );
                 device.poll(wgpu::Maintain::Wait);
+                let _gpu_time = Instant::now() - start;
+                //println!("{} samples in {:?}", samples_per_iter, gpu_time);
                 while let Ok(buf) = rx.try_recv() {
                     let mut i = 0;
                     while i < buf.len().min(samples_per_iter as usize) {
@@ -312,7 +317,7 @@ fn main() -> anyhow::Result<()> {
                         i += ret;
                     }
                 }
-                time += (samples_per_iter / sample_rate.0) as f32;
+                samples_elapsed += samples_per_iter;
             }
         }
     });

@@ -1,5 +1,5 @@
 struct Params {
-    time: f32,
+    samples_elapsed: u32,
     sample_rate: u32,
     samples: u32,
     slider1: f32,
@@ -25,15 +25,18 @@ const TAU: f32 = 6.283185307179586;
 
 @compute @workgroup_size(1)
 fn compute_main() {
+    let time = f32(params.samples_elapsed) / f32(params.sample_rate);
     for(var i=0u; i < params.samples; i += 1u) {
-        let t = params.time + (f32(i) / f32(params.sample_rate));
+        let t = time + (f32(i) / f32(params.sample_rate));
         let pan = abs(sin(params.slider2 * TAU * t));
         //let pan = 0.0;
         //let a = sin((440.0 + 40.0 * t)*t);
-        let a = sin((mix(440.0, 880.0, params.slider1) * t) % TAU);
-        //let b = sin((880.0 * t) % TAU);
-        let b = triangle((220.0 * t) % 1.0);
-        //let a = square((440.0 * t) % 1.0);
+        let freq1 = mix(440.0, 880.0, params.slider1);
+        let freq2 = 220.0;
+        let a = sin((freq1 * t) % TAU);
+        //let b = sin((freq2* t) % TAU);
+        let b = triangle((freq2 * t) % 1.0);
+        //let b = square((freq2 * t) % 1.0);
         output.buffer[2u*i+0u] = pan * a + (1.0 - pan) * b;
         output.buffer[2u*i+1u] = (1.0 - pan) * a + pan * b;
         //output.buffer[2u*i+0u] = a;
