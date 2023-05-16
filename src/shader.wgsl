@@ -18,6 +18,24 @@ fn square(t: f32) -> f32 {
     if t < 0.5 { return 1.0; } else { return -1.0; };
 }
 
+fn envelope1(t: f32, x: f32) -> f32 {
+    let t2 = t % x;
+    if t2 < 1.0 {
+        return t2;
+    } else {
+        return 0.0;
+    }
+}
+
+fn envelope2(t: f32, x: f32) -> f32 {
+    let t2 = t % x;
+    if t2 < 1.0 {
+        return 1.0 - t2;
+    } else {
+        return 0.0;
+    }
+}
+
 const TAU: f32 = 6.283185307179586;
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -33,13 +51,17 @@ fn compute_main() {
         //let a = sin((440.0 + 40.0 * t)*t);
         let freq1 = mix(440.0, 880.0, params.slider1);
         let freq2 = 220.0;
-        let a = sin((freq1 * t) % TAU);
+        //let a = sin((freq1 * t) % TAU);
         //let b = sin((freq2* t) % TAU);
         let b = triangle((freq2 * t) % 1.0);
         //let b = square((freq2 * t) % 1.0);
-        output.buffer[2u*i+0u] = pan * a + (1.0 - pan) * b;
-        output.buffer[2u*i+1u] = (1.0 - pan) * a + pan * b;
-        //output.buffer[2u*i+0u] = a;
-        //output.buffer[2u*i+1u] = a;
+        let a = envelope2(t, 2.0) * sin(((params.slider2 * (2.0 * envelope1(t, 1.0)) + freq1) * t) % TAU);
+        if false {
+            output.buffer[2u*i+0u] = pan * a + (1.0 - pan) * b;
+            output.buffer[2u*i+1u] = (1.0 - pan) * a + pan * b;
+        } else {
+            output.buffer[2u*i+0u] = a;
+            output.buffer[2u*i+1u] = a;
+        }
     }
 }
