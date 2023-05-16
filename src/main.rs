@@ -1,27 +1,22 @@
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
-use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-    StreamConfig,
-};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use egui::plot::Line;
 use futures_executor::block_on;
-use oddio::{Frames, FramesSignal, Gain, Handle, Mixer, Reinhard, Signal, StreamControl};
+use oddio::{Gain, Handle, Mixer, Reinhard};
 use std::{
     borrow::Cow,
-    collections::HashMap,
     fs::File,
-    io::Cursor,
     io::Read,
     mem,
     num::NonZeroU64,
     sync::mpsc::{self, TryRecvError},
-    sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 struct EguiApp {
     scene_handle: Handle<Gain<Reinhard<Mixer<[f32; 2]>>>>,
+    #[allow(unused)]
     cpal_stream: cpal::platform::Stream,
     volume: f32,
     cmd_tx: mpsc::Sender<Command>,
@@ -59,7 +54,7 @@ impl EguiApp {
 }
 
 impl eframe::App for EguiApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         use egui::{CentralPanel, Slider};
         while let Ok(mut plot) = self.plot_rx.try_recv() {
             let (mut left, mut right) = (Vec::new(), Vec::new());
