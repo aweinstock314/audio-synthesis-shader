@@ -117,6 +117,12 @@ struct Params {
     sliders: [f32; 2],
 }
 
+#[derive(Copy, Clone, Pod, Zeroable)]
+#[repr(C)]
+struct Phases {
+    phases: [f32; 2],
+}
+
 enum Command {
     ReloadPipeline,
     SetSlider(usize, f32),
@@ -191,6 +197,16 @@ fn main() -> anyhow::Result<()> {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: false },
                     has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(mem::size_of::<Phases>() as u64),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
                     min_binding_size: NonZeroU64::new(4),
                 },
                 count: None,
@@ -201,6 +217,14 @@ fn main() -> anyhow::Result<()> {
         label: None,
         size: mem::size_of::<Params>() as u64,
         usage: wgpu::BufferUsages::UNIFORM
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let phases_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: mem::size_of::<Phases>() as u64,
+        usage: wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
@@ -223,6 +247,10 @@ fn main() -> anyhow::Result<()> {
             },
             wgpu::BindGroupEntry {
                 binding: 1,
+                resource: phases_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
                 resource: output_buffer.as_entire_binding(),
             },
         ],

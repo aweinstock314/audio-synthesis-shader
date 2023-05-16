@@ -6,9 +6,18 @@ struct Params {
     slider2: f32,
 }
 
+struct Phases {
+    phase1: f32,
+    phase2: f32,
+}
+
 struct Output {
     buffer: array<f32>,
 }
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read_write> phases: Phases;
+@group(0) @binding(2) var<storage, read_write> output: Output;
 
 fn triangle(t: f32) -> f32 {
     return 2.0 * abs(t - floor(t + 0.5)) - 0.5;
@@ -20,8 +29,8 @@ fn square(t: f32) -> f32 {
 
 fn envelope1(t: f32, x: f32) -> f32 {
     let t2 = t % x;
-    if t2 < 1.0 {
-        return t2;
+    if t2 <= 1.0 {
+        return clamp(t2, 0.0, 1.0);
     } else {
         return 0.0;
     }
@@ -29,7 +38,7 @@ fn envelope1(t: f32, x: f32) -> f32 {
 
 fn envelope2(t: f32, x: f32) -> f32 {
     let t2 = t % x;
-    if t2 < 1.0 {
+    if t2 <= 1.0 {
         return 1.0 - t2;
     } else {
         return 0.0;
@@ -37,9 +46,6 @@ fn envelope2(t: f32, x: f32) -> f32 {
 }
 
 const TAU: f32 = 6.283185307179586;
-
-@group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read_write> output: Output;
 
 @compute @workgroup_size(1)
 fn compute_main() {
@@ -55,7 +61,15 @@ fn compute_main() {
         //let b = sin((freq2* t) % TAU);
         let b = triangle((freq2 * t) % 1.0);
         //let b = square((freq2 * t) % 1.0);
-        let a = envelope2(t, 2.0) * sin(((params.slider2 * (2.0 * envelope1(t, 1.0)) + freq1) * t) % TAU);
+        //let a = /*envelope2(t, 2.0) **/ sin(((params.slider2 * (32.0 * sin(t%TAU)) + freq1) * t) % TAU);
+        //let a = /*envelope2(t, 2.0) **/ sin((((64.0 * triangle((mix(220.0, 330.0, params.slider2) * t) % 1.0)) + freq1) * t) % TAU);
+        //let a = /*envelope2(t, 2.0) **/ envelope1(t, 1.0);
+        //let a = triangle(((1.0 * sin((48.0*(t+0.1)) % TAU) + freq1) * t) % 1.0);
+        //let a = sin((440.0 * t) % TAU);
+        //let a = sin((1000.0 * t) % TAU);
+        let freq3 = (64.0 * triangle(t % 1.0)) + 440.0;
+        phases.phase1 = (phases.phase1 + freq3/f32(params.sample_rate)) % TAU;
+        let a = sin(phases.phase1);
         if false {
             output.buffer[2u*i+0u] = pan * a + (1.0 - pan) * b;
             output.buffer[2u*i+1u] = (1.0 - pan) * a + pan * b;
