@@ -4,6 +4,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     StreamConfig,
 };
+use egui::plot::Line;
 use futures_executor::block_on;
 use oddio::{Frames, FramesSignal, Gain, Handle, Mixer, Reinhard, Signal, StreamControl};
 use std::{
@@ -24,7 +25,9 @@ struct EguiApp {
     cpal_stream: cpal::platform::Stream,
     volume: f32,
     cmd_tx: mpsc::Sender<Command>,
+    plot_rx: mpsc::Receiver<Vec<[f32; 2]>>,
     sliders: [f32; 2],
+    plots: Option<(Vec<f32>, Vec<f32>)>,
 }
 
 impl EguiApp {
@@ -33,13 +36,24 @@ impl EguiApp {
         scene_handle: Handle<Gain<Reinhard<Mixer<[f32; 2]>>>>,
         cpal_stream: cpal::platform::Stream,
         cmd_tx: mpsc::Sender<Command>,
+        plot_rx: mpsc::Receiver<Vec<[f32; 2]>>,
     ) -> Self {
+        let ctx = cc.egui_ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(plot) = plot_rx.recv() {
+                let _ = tx.send(plot);
+                ctx.request_repaint();
+            }
+        });
         EguiApp {
             scene_handle,
             cpal_stream,
             volume: 0.0,
             cmd_tx,
+            plot_rx: rx,
             sliders: [0.0; 2],
+            plots: None,
         }
     }
 }
@@ -47,6 +61,14 @@ impl EguiApp {
 impl eframe::App for EguiApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         use egui::{CentralPanel, Slider};
+        while let Ok(mut plot) = self.plot_rx.try_recv() {
+            let (mut left, mut right) = (Vec::new(), Vec::new());
+            for x in plot.drain(..) {
+                left.push(x[0]);
+                right.push(x[1]);
+            }
+            self.plots = Some((left, right));
+        }
         CentralPanel::default().show(ctx, |ui| {
             let volume_slider = Slider::new(&mut self.volume, -60.0..=20.0)
                 .prefix("volume: ")
@@ -61,16 +83,26 @@ impl eframe::App for EguiApp {
                 let _ = self.cmd_tx.send(Command::ReloadPipeline);
             }
             for i in 0..2 {
-                if ui
-                    .add(
-                        Slider::new(&mut self.sliders[i], 0.0..=1.0)
-                            .prefix(format!("slider{}:", i + 1))
-                            .show_value(true),
-                    )
-                    .changed()
-                {
+                let slider = Slider::new(&mut self.sliders[i], 0.0..=1.0)
+                    .prefix(format!("slider{}:", i + 1))
+                    .show_value(true);
+                if ui.add(slider).changed() {
                     let _ = self.cmd_tx.send(Command::SetSlider(i, self.sliders[i]));
                 }
+            }
+            if let Some((left, right)) = &self.plots {
+                use egui::plot::{Plot, PlotPoints};
+                let plot_aspect = ui.available_width() / 200.0;
+                let left_points = PlotPoints::from_ys_f32(&left);
+                let right_points = PlotPoints::from_ys_f32(&right);
+                let left_line = Line::new(left_points);
+                let right_line = Line::new(right_points);
+                Plot::new("left_channel")
+                    .view_aspect(plot_aspect)
+                    .show(ui, |plot_ui| plot_ui.line(left_line));
+                Plot::new("right_channel")
+                    .view_aspect(plot_aspect)
+                    .show(ui, |plot_ui| plot_ui.line(right_line));
             }
         });
     }
@@ -219,6 +251,7 @@ fn main() -> anyhow::Result<()> {
         })
     };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (plot_tx, plot_rx) = std::sync::mpsc::channel();
 
     let mut belt = wgpu::util::StagingBelt::new(1024);
     std::thread::spawn({
@@ -293,11 +326,14 @@ fn main() -> anyhow::Result<()> {
                     &output_buffer.slice(..),
                     {
                         let tx = tx.clone();
+                        let plot_tx = plot_tx.clone();
                         move |buf| {
                             if let Ok(buf) = buf {
-                                let cast_buf = bytemuck::cast_slice::<u8, [f32; 2]>(&buf);
+                                let cast_buf = &bytemuck::cast_slice::<u8, [f32; 2]>(&buf)
+                                    [..samples_per_iter as usize];
                                 //println!("read_buffer: {:?} {:?}", cast_buf.len(), &cast_buf[0..10]);
                                 let _ = tx.send(cast_buf.to_vec());
+                                let _ = plot_tx.send(cast_buf.to_vec());
                             }
                         }
                     },
@@ -328,7 +364,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "audio-synthesis-shader",
         native_options,
-        Box::new(|cc| Box::new(EguiApp::new(cc, scene_handle, cpal_stream, cmd_tx))),
+        Box::new(|cc| Box::new(EguiApp::new(cc, scene_handle, cpal_stream, cmd_tx, plot_rx))),
     )
     .unwrap();
 
