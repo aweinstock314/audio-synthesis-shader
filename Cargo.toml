@@ -13,4 +13,4 @@ eframe = "0.21"
 egui = "0.21"
 futures-executor = "0.3"
 oddio = "0.6"
-wgpu = { version = "0.15", features = ["trace"] }
+wgpu = "0.15"

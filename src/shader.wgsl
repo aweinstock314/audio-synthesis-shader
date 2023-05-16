@@ -2,6 +2,8 @@ struct Params {
     time: f32,
     sample_rate: u32,
     samples: u32,
+    slider1: f32,
+    slider2: f32,
 }
 
 struct Output {
@@ -25,10 +27,10 @@ const TAU: f32 = 6.283185307179586;
 fn compute_main() {
     for(var i=0u; i < params.samples; i += 1u) {
         let t = params.time + (f32(i) / f32(params.sample_rate));
-        let pan = abs(sin(1.0 * TAU * t));
+        let pan = abs(sin(params.slider2 * TAU * t));
         //let pan = 0.0;
         //let a = sin((440.0 + 40.0 * t)*t);
-        let a = sin((440.0 * t) % TAU);
+        let a = sin((mix(440.0, 880.0, params.slider1) * t) % TAU);
         //let b = sin((880.0 * t) % TAU);
         let b = triangle((220.0 * t) % 1.0);
         //let a = square((440.0 * t) % 1.0);

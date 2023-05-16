@@ -7,7 +7,15 @@ use cpal::{
 use futures_executor::block_on;
 use oddio::{Frames, FramesSignal, Gain, Handle, Mixer, Reinhard, Signal, StreamControl};
 use std::{
-    borrow::Cow, collections::HashMap, fs::File, io::Cursor, io::Read, num::NonZeroU64, sync::Arc,
+    borrow::Cow,
+    collections::HashMap,
+    fs::File,
+    io::Cursor,
+    io::Read,
+    mem,
+    num::NonZeroU64,
+    sync::mpsc::{self, TryRecvError},
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,6 +23,8 @@ struct EguiApp {
     scene_handle: Handle<Gain<Reinhard<Mixer<[f32; 2]>>>>,
     cpal_stream: cpal::platform::Stream,
     volume: f32,
+    cmd_tx: mpsc::Sender<Command>,
+    sliders: [f32; 2],
 }
 
 impl EguiApp {
@@ -22,11 +32,14 @@ impl EguiApp {
         cc: &eframe::CreationContext<'_>,
         scene_handle: Handle<Gain<Reinhard<Mixer<[f32; 2]>>>>,
         cpal_stream: cpal::platform::Stream,
+        cmd_tx: mpsc::Sender<Command>,
     ) -> Self {
         EguiApp {
             scene_handle,
             cpal_stream,
             volume: 0.0,
+            cmd_tx,
+            sliders: [0.0; 2],
         }
     }
 }
@@ -35,18 +48,29 @@ impl eframe::App for EguiApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         use egui::{CentralPanel, Slider};
         CentralPanel::default().show(ctx, |ui| {
-            if ui
-                .add(
-                    Slider::new(&mut self.volume, -60.0..=20.0)
-                        .prefix("volume: ")
-                        .suffix("db")
-                        .show_value(true),
-                )
-                .changed()
-            {
+            let volume_slider = Slider::new(&mut self.volume, -60.0..=20.0)
+                .prefix("volume: ")
+                .suffix("db")
+                .show_value(true);
+            if ui.add(volume_slider).changed() {
                 self.scene_handle
                     .control::<Gain<_>, _>()
                     .set_gain(self.volume);
+            }
+            if ui.button("Reload shader").clicked() {
+                let _ = self.cmd_tx.send(Command::ReloadPipeline);
+            }
+            for i in 0..2 {
+                if ui
+                    .add(
+                        Slider::new(&mut self.sliders[i], 0.0..=1.0)
+                            .prefix(format!("slider{}:", i + 1))
+                            .show_value(true),
+                    )
+                    .changed()
+                {
+                    let _ = self.cmd_tx.send(Command::SetSlider(i, self.sliders[i]));
+                }
             }
         });
     }
@@ -58,6 +82,12 @@ struct Params {
     time: f32,
     sample_rate: u32,
     samples: u32,
+    sliders: [f32; 2],
+}
+
+enum Command {
+    ReloadPipeline,
+    SetSlider(usize, f32),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -90,10 +120,8 @@ fn main() -> anyhow::Result<()> {
     )?;
     cpal_stream.play()?;
 
-    let (mut oddio_stream_handle, oddio_stream) = oddio::split(oddio::Stream::new(
-        sample_rate.0,
-        sample_rate.0 as usize,
-    ));
+    let (mut oddio_stream_handle, oddio_stream) =
+        oddio::split(oddio::Stream::new(sample_rate.0, sample_rate.0 as usize));
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let adapter = instance
@@ -106,7 +134,7 @@ fn main() -> anyhow::Result<()> {
             features: adapter.features(),
             limits: adapter.limits(),
         },
-        Some(std::path::Path::new("./wgpu-trace.txt")),
+        None,
     ))
     .expect("wgpu::Adapter::request_device");
 
@@ -119,7 +147,7 @@ fn main() -> anyhow::Result<()> {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: NonZeroU64::new(12),
+                    min_binding_size: NonZeroU64::new(mem::size_of::<Params>() as u64),
                 },
                 count: None,
             },
@@ -137,7 +165,7 @@ fn main() -> anyhow::Result<()> {
     });
     let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 12,
+        size: mem::size_of::<Params>() as u64,
         usage: wgpu::BufferUsages::UNIFORM
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC,
@@ -170,75 +198,122 @@ fn main() -> anyhow::Result<()> {
         bind_group_layouts: &[&bind_group_layout],
         push_constant_ranges: &[],
     });
-    let shader_source = {
-        let mut source = String::new();
-        let mut f = File::open("src/shader.wgsl")?;
-        f.read_to_string(&mut source)?;
-        source
+    let mut pipeline = {
+        let shader_source = {
+            let mut source = String::new();
+            let mut f = File::open("src/shader.wgsl")?;
+            f.read_to_string(&mut source)?;
+            source
+        };
+        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
+        });
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: "compute_main",
+        })
     };
-    let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: None,
-        source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
-    });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: None,
-        layout: Some(&pipeline_layout),
-        module: &shader_module,
-        entry_point: "compute_main",
-    });
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
 
     let mut belt = wgpu::util::StagingBelt::new(1024);
-    std::thread::spawn(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut time = 0.0;
-        loop {
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            belt.write_buffer(
-                &mut encoder,
-                &params_buffer,
-                0,
-                NonZeroU64::new(12).unwrap(),
-                &device,
-            )
-            .copy_from_slice(bytemuck::bytes_of(&Params {
-                time,
-                sample_rate: sample_rate.0,
-                samples: sample_rate.0,
-            }));
-            belt.finish();
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-                pass.set_pipeline(&pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
-                drop(pass);
-            }
-            let _ = queue.submit(vec![encoder.finish()]);
-            wgpu::util::DownloadBuffer::read_buffer(&device, &queue, &output_buffer.slice(..), {
-                let tx = tx.clone();
-                move |buf| {
-                    if let Ok(buf) = buf {
-                        let cast_buf = bytemuck::cast_slice::<u8, [f32; 2]>(&buf);
-                        //println!("read_buffer: {:?} {:?}", cast_buf.len(), &cast_buf[0..10]);
-                        let _ = tx.send(cast_buf.to_vec());
+    std::thread::spawn({
+        move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut time = 0.0;
+            let samples_per_iter = sample_rate.0;
+            let mut sliders = [0.0; 2];
+            'outer: loop {
+                'inner: loop {
+                    match cmd_rx.try_recv() {
+                        Ok(Command::ReloadPipeline) => {
+                            pipeline = {
+                                let shader_source = {
+                                    let mut source = String::new();
+                                    if let Ok(mut f) = File::open("src/shader.wgsl") {
+                                        let _ = f.read_to_string(&mut source);
+                                        source
+                                    } else {
+                                        continue 'inner;
+                                    }
+                                };
+                                let shader_module =
+                                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                                        label: None,
+                                        source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
+                                    });
+                                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                                    label: None,
+                                    layout: Some(&pipeline_layout),
+                                    module: &shader_module,
+                                    entry_point: "compute_main",
+                                })
+                            };
+                        }
+                        Ok(Command::SetSlider(i, x)) => {
+                            sliders[i] = x;
+                        }
+                        Err(TryRecvError::Empty) => break 'inner,
+                        Err(TryRecvError::Disconnected) => break 'outer,
                     }
                 }
-            });
-            device.poll(wgpu::Maintain::Wait);
-            while let Ok(buf) = rx.try_recv() {
-                let mut i = 0;
-                while i < buf.len() {
-                    let ret = oddio_stream_handle
-                        .control::<oddio::Stream<_>, _>()
-                        .write(&buf[i..]);
-                    if ret == 0 {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    i += ret;
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                belt.write_buffer(
+                    &mut encoder,
+                    &params_buffer,
+                    0,
+                    NonZeroU64::new(mem::size_of::<Params>() as u64).unwrap(),
+                    &device,
+                )
+                .copy_from_slice(bytemuck::bytes_of(&Params {
+                    time,
+                    sample_rate: sample_rate.0,
+                    samples: samples_per_iter,
+                    sliders,
+                }));
+                belt.finish();
+                {
+                    let mut pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                    pass.set_pipeline(&pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                    drop(pass);
                 }
+                let _ = queue.submit(vec![encoder.finish()]);
+                wgpu::util::DownloadBuffer::read_buffer(
+                    &device,
+                    &queue,
+                    &output_buffer.slice(..),
+                    {
+                        let tx = tx.clone();
+                        move |buf| {
+                            if let Ok(buf) = buf {
+                                let cast_buf = bytemuck::cast_slice::<u8, [f32; 2]>(&buf);
+                                //println!("read_buffer: {:?} {:?}", cast_buf.len(), &cast_buf[0..10]);
+                                let _ = tx.send(cast_buf.to_vec());
+                            }
+                        }
+                    },
+                );
+                device.poll(wgpu::Maintain::Wait);
+                while let Ok(buf) = rx.try_recv() {
+                    let mut i = 0;
+                    while i < buf.len().min(samples_per_iter as usize) {
+                        let ret = oddio_stream_handle
+                            .control::<oddio::Stream<_>, _>()
+                            .write(&buf[i..samples_per_iter as usize]);
+                        if ret == 0 {
+                            //std::thread::sleep(Duration::from_millis(50));
+                        }
+                        i += ret;
+                    }
+                }
+                time += (samples_per_iter / sample_rate.0) as f32;
             }
-            time += 1.0;
         }
     });
 
@@ -248,7 +323,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "audio-synthesis-shader",
         native_options,
-        Box::new(|cc| Box::new(EguiApp::new(cc, scene_handle, cpal_stream))),
+        Box::new(|cc| Box::new(EguiApp::new(cc, scene_handle, cpal_stream, cmd_tx))),
     )
     .unwrap();
 
