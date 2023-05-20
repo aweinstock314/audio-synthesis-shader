@@ -378,6 +378,7 @@ dependencies = [
  "eframe",
  "egui",
  "futures-executor",
+ "naga",
  "oddio",
  "wgpu",
 ]

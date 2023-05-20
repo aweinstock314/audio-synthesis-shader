@@ -6,6 +6,7 @@ use futures_executor::block_on;
 use oddio::{Gain, Handle, Mixer, Reinhard};
 use std::{
     borrow::Cow,
+    collections::HashMap,
     fs::File,
     io::Read,
     mem,
@@ -20,9 +21,11 @@ struct EguiApp {
     cpal_stream: cpal::platform::Stream,
     volume: f32,
     cmd_tx: mpsc::Sender<Command>,
-    plot_rx: mpsc::Receiver<Vec<[f32; 2]>>,
+    ui_rx: mpsc::Receiver<UiCommand>,
     sliders: [f32; 2],
     plots: Option<(Vec<f32>, Vec<f32>)>,
+    entry_points: Vec<String>,
+    current_pipeline: String,
 }
 
 impl EguiApp {
@@ -31,12 +34,14 @@ impl EguiApp {
         scene_handle: Handle<Gain<Reinhard<Mixer<[f32; 2]>>>>,
         cpal_stream: cpal::platform::Stream,
         cmd_tx: mpsc::Sender<Command>,
-        plot_rx: mpsc::Receiver<Vec<[f32; 2]>>,
+        ui_rx: mpsc::Receiver<UiCommand>,
+        entry_points: Vec<String>,
+        current_pipeline: String,
     ) -> Self {
         let ctx = cc.egui_ctx.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            while let Ok(plot) = plot_rx.recv() {
+            while let Ok(plot) = ui_rx.recv() {
                 let _ = tx.send(plot);
                 ctx.request_repaint();
             }
@@ -46,9 +51,11 @@ impl EguiApp {
             cpal_stream,
             volume: 0.0,
             cmd_tx,
-            plot_rx: rx,
+            ui_rx: rx,
             sliders: [0.0; 2],
             plots: None,
+            entry_points,
+            current_pipeline,
         }
     }
 }
@@ -56,13 +63,21 @@ impl EguiApp {
 impl eframe::App for EguiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         use egui::{CentralPanel, Slider};
-        while let Ok(mut plot) = self.plot_rx.try_recv() {
-            let (mut left, mut right) = (Vec::new(), Vec::new());
-            for x in plot.drain(..) {
-                left.push(x[0]);
-                right.push(x[1]);
+        while let Ok(cmd) = self.ui_rx.try_recv() {
+            match cmd {
+                UiCommand::PlotData(mut plot) => {
+                    let (mut left, mut right) = (Vec::new(), Vec::new());
+                    for x in plot.drain(..) {
+                        left.push(x[0]);
+                        right.push(x[1]);
+                    }
+                    self.plots = Some((left, right));
+                }
+                UiCommand::NewPipelines(entry_points, current_pipeline) => {
+                    self.entry_points = entry_points;
+                    self.current_pipeline = current_pipeline;
+                }
             }
-            self.plots = Some((left, right));
         }
         CentralPanel::default().show(ctx, |ui| {
             let volume_slider = Slider::new(&mut self.volume, -60.0..=20.0)
@@ -85,6 +100,18 @@ impl eframe::App for EguiApp {
                     let _ = self.cmd_tx.send(Command::SetSlider(i, self.sliders[i]));
                 }
             }
+            ui.horizontal(|ui| {
+                for entry_point in self.entry_points.iter() {
+                    if ui
+                        .radio_value(&mut self.current_pipeline, entry_point.clone(), entry_point)
+                        .changed()
+                    {
+                        let _ = self
+                            .cmd_tx
+                            .send(Command::SetCurrentPipeline(self.current_pipeline.clone()));
+                    }
+                }
+            });
             if let Some((left, right)) = &self.plots {
                 use egui::plot::{Plot, PlotPoints};
                 let plot_aspect = ui.available_width() / 200.0;
@@ -115,12 +142,71 @@ struct Params {
 #[derive(Copy, Clone, Pod, Zeroable)]
 #[repr(C)]
 struct Phases {
-    phases: [f32; 2],
+    phases: [f32; 3],
 }
 
 enum Command {
     ReloadPipeline,
     SetSlider(usize, f32),
+    SetCurrentPipeline(String),
+}
+
+enum UiCommand {
+    PlotData(Vec<[f32; 2]>),
+    NewPipelines(Vec<String>, String),
+}
+
+struct Pipelines {
+    pipelines: HashMap<String, wgpu::ComputePipeline>,
+    current_pipeline: String,
+    entry_points: Vec<String>,
+}
+
+impl Pipelines {
+    fn from_str(
+        device: &wgpu::Device,
+        pipeline_layout: &wgpu::PipelineLayout,
+        shader_source: &str,
+    ) -> anyhow::Result<Self> {
+        match naga::front::wgsl::Parser::new().parse(&shader_source) {
+            Ok(module) => {
+                let entry_points = module
+                    .entry_points
+                    .iter()
+                    .map(|ep| ep.name.clone())
+                    .collect::<Vec<String>>();
+                println!("entry_points: {:?}", entry_points);
+                anyhow::ensure!(!entry_points.is_empty(), "No entry points found");
+                let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: None,
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shader_source)),
+                });
+                let mut ret = Pipelines {
+                    pipelines: HashMap::new(),
+                    current_pipeline: entry_points[0].clone(),
+                    entry_points: entry_points.clone(),
+                };
+                for entry_point in entry_points.into_iter() {
+                    let pipeline =
+                        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: None,
+                            layout: Some(&pipeline_layout),
+                            module: &shader_module,
+                            entry_point: &entry_point,
+                        });
+                    ret.pipelines.insert(entry_point, pipeline);
+                }
+                Ok(ret)
+            }
+            Err(e) => {
+                e.emit_to_stderr(&shader_source);
+                Err(e)?
+            }
+        }
+    }
+    fn keys(&self) -> Vec<String> {
+        self.entry_points.clone()
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -255,26 +341,19 @@ fn main() -> anyhow::Result<()> {
         bind_group_layouts: &[&bind_group_layout],
         push_constant_ranges: &[],
     });
-    let mut pipeline = {
+    let mut pipelines = {
         let shader_source = {
             let mut source = String::new();
             let mut f = File::open("src/shader.wgsl")?;
             f.read_to_string(&mut source)?;
             source
         };
-        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
-        });
-        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None,
-            layout: Some(&pipeline_layout),
-            module: &shader_module,
-            entry_point: "compute_main",
-        })
+        Pipelines::from_str(&device, &pipeline_layout, &shader_source)?
     };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-    let (plot_tx, plot_rx) = std::sync::mpsc::channel();
+    let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+    let initial_entry_points = pipelines.keys();
+    let initial_pipeline = pipelines.current_pipeline.clone();
 
     let mut belt = wgpu::util::StagingBelt::new(1024);
     std::thread::spawn({
@@ -287,31 +366,31 @@ fn main() -> anyhow::Result<()> {
                 'inner: loop {
                     match cmd_rx.try_recv() {
                         Ok(Command::ReloadPipeline) => {
-                            pipeline = {
-                                let shader_source = {
-                                    let mut source = String::new();
-                                    if let Ok(mut f) = File::open("src/shader.wgsl") {
-                                        let _ = f.read_to_string(&mut source);
-                                        source
-                                    } else {
-                                        continue 'inner;
-                                    }
-                                };
-                                let shader_module =
-                                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                                        label: None,
-                                        source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
-                                    });
-                                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                                    label: None,
-                                    layout: Some(&pipeline_layout),
-                                    module: &shader_module,
-                                    entry_point: "compute_main",
-                                })
+                            let shader_source = {
+                                let mut source = String::new();
+                                if let Ok(mut f) = File::open("src/shader.wgsl") {
+                                    let _ = f.read_to_string(&mut source);
+                                    source
+                                } else {
+                                    continue 'inner;
+                                }
                             };
+                            match Pipelines::from_str(&device, &pipeline_layout, &shader_source) {
+                                Ok(new_pipelines) => {
+                                    pipelines = new_pipelines;
+                                    let _ = ui_tx.send(UiCommand::NewPipelines(
+                                        pipelines.keys(),
+                                        pipelines.current_pipeline.clone(),
+                                    ));
+                                }
+                                Err(_) => continue 'inner,
+                            }
                         }
                         Ok(Command::SetSlider(i, x)) => {
                             sliders[i] = x;
+                        }
+                        Ok(Command::SetCurrentPipeline(current_pipeline)) => {
+                            pipelines.current_pipeline = current_pipeline;
                         }
                         Err(TryRecvError::Empty) => break 'inner,
                         Err(TryRecvError::Disconnected) => break 'outer,
@@ -337,7 +416,12 @@ fn main() -> anyhow::Result<()> {
                 {
                     let mut pass =
                         encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-                    pass.set_pipeline(&pipeline);
+                    pass.set_pipeline(
+                        &pipelines
+                            .pipelines
+                            .get(&pipelines.current_pipeline)
+                            .unwrap(),
+                    );
                     pass.set_bind_group(0, &bind_group, &[]);
                     pass.dispatch_workgroups(1, 1, 1);
                     drop(pass);
@@ -349,14 +433,14 @@ fn main() -> anyhow::Result<()> {
                     &output_buffer.slice(..),
                     {
                         let tx = tx.clone();
-                        let plot_tx = plot_tx.clone();
+                        let ui_tx = ui_tx.clone();
                         move |buf| {
                             if let Ok(buf) = buf {
                                 let cast_buf = &bytemuck::cast_slice::<u8, [f32; 2]>(&buf)
                                     [..samples_per_iter as usize];
                                 //println!("read_buffer: {:?} {:?}", cast_buf.len(), &cast_buf[0..10]);
                                 let _ = tx.send(cast_buf.to_vec());
-                                let _ = plot_tx.send(cast_buf.to_vec());
+                                let _ = ui_tx.send(UiCommand::PlotData(cast_buf.to_vec()));
                             }
                         }
                     },
@@ -387,7 +471,17 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "audio-synthesis-shader",
         native_options,
-        Box::new(|cc| Box::new(EguiApp::new(cc, scene_handle, cpal_stream, cmd_tx, plot_rx))),
+        Box::new(|cc| {
+            Box::new(EguiApp::new(
+                cc,
+                scene_handle,
+                cpal_stream,
+                cmd_tx,
+                ui_rx,
+                initial_entry_points,
+                initial_pipeline,
+            ))
+        }),
     )
     .unwrap();
 
